@@ -11,87 +11,293 @@ from openzwave.network import ZWaveNetwork
 
 import qth
 
-"""
-Properties to expose for each ZWave Node.
 
-NODE_PROPERTIES = {propname: (description, None or conversion_fn), ...}
-"""
-NODE_PROPERTIES = {
-    "product_name": ("Product name of the node.", None),
-    "product_type": ("Product type of the node.", None),
-    "product_id": ("ZWave product ID of the node.", None),
-    "device_type": ("ZWave device type of the node.", None),
-    "role": ("ZWave device type of the node.", None),
-    "capabilities": ("List of ZWave device "
-                    "capabilities supported "
-                    "by the node.", list),
-    "neighbours": ("List of ZWave node IDs within range.", list),
-    "command_classes": ("List of ZWave command classes supported.", list),
-    "manufacturer_id": ("ZWave manufacturer ID type of the node.", None),
-    "manufacturer_name": ("Manufacturer name of the node.", None),
-    "generic": ("ZWave generic type of the node.", None),
-    "basic": ("ZWave basic type of the node.", None),
-    "specific": ("ZWave specific type of the node.", None),
-    "security": ("ZWave security type of the node.", None),
-    "version": ("ZWave version of the node.", None),
-    "is_listening_device": ("Is a ZWave listening device.", None),
-    "is_beaming_device": ("Is a ZWave beaming device.", None),
-    "is_frequent_listening_device": ("Is a ZWave frequent listening device.", None),
-    "is_security_device": ("Is a ZWave security device.", None),
-    "is_routing_device": ("Is a ZWave routing device.", None),
-    "is_zwave_plus": ("Supports the ZWave+ protocol extensions.", None),
-    "is_locked": ("Is the node locked.", None),
-    "is_sleeping": ("Is the node in a sleep state.", None),
-    "max_baud_rate": ("The node's maximum baudrate.", None),
-    "is_awake": ("Is the node in a non-sleep state.", None),
-    "is_failed": ("Has the node failed/become unavailable.", None),
-    "query_stage": ("Is the node in the ZWave query stage of initialisation.", None),
-    "is_ready": ("Is the node ready.", None),
-    "is_info_received": ("Has the ZWave node information been received.", None),
-    "type": ("The type of ZWave node.", None),
-}
+class Node(object):
+    """
+    Logic which keeps a ZWave node object in sync with its Qth interface.
+    """
+    def __init__(self, client, loop, ozw_network, ozw_node, qth_base_path):
+        self._client = client
+        self._loop = loop
+        self._ozw_network = ozw_network
+        self._ozw_node = ozw_node
+        
+        self._is_initialised = asyncio.Event(loop=self._loop)
+        
+        self._qth_base_path = (qth_base_path +
+                               "{}/".format(self._ozw_node.node_id))
+        
+        self._is_failed_path = self._qth_base_path + "is_failed"
+        self._manufacturer_id_path = self._qth_base_path + "manufacturer_id"
+        self._manufacturer_name_path = self._qth_base_path + "manufacturer_name"
+        self._neighbours_path = self._qth_base_path + "neighbours"
+        self._product_id_path = self._qth_base_path + "product_id"
+        self._product_name_path = self._qth_base_path + "product_name"
+        self._product_type_path = self._qth_base_path + "product_type"
+        self._heal_path = self._qth_base_path + "heal"
+        self._set_config_param_path = self._qth_base_path + "set_config_param"
+        self._remove_failed_node_path = self._qth_base_path + "remove_failed_node"
+        
+        # {ozw.ZWaveValue: Value, ...}
+        self._values = {}
+    
+    async def init_async(self):
+        """
+        Complete registration of the node. Must be called after instantiation.
+        """
+        try:
+            await asyncio.wait([
+                self._client.register(
+                    self._is_failed_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "Boolean. True if the device has been marked as failed by the "
+                    "ZWave controller.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._manufacturer_id_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "String. The hex representation of the ZWave manufacturer ID.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._manufacturer_name_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "String. The manufacturer's name.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._neighbours_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "Array of Integers. The Node IDs of other nodes visible from "
+                    "this node.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._product_id_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "String. The hex representation of the ZWave product ID.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._product_name_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "String. The product name.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._product_type_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "String. The ZWave product type code.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._heal_path,
+                    qth.EVENT_MANY_TO_ONE,
+                    "Send this event to attempt to trigger the node healing "
+                    "process."),
+                self._client.register(
+                    self._set_config_param_path,
+                    qth.EVENT_MANY_TO_ONE,
+                    "Send this event to attempt set a config parameter on a ZWave "
+                    "device. Expects as argument an array [parameter_id, value, "
+                    "num_bytes] where the final argument (num_bytes) may be "
+                    "omitted and defaults to 1."),
+                self._client.register(
+                    self._remove_failed_node_path,
+                    qth.EVENT_MANY_TO_ONE,
+                    "Send this event to instruct the ZWave controller to remove "
+                    "this node. Only use on nodes whose 'is_failed' property is "
+                    "true."),
+                self._client.set_property(self._is_failed_path,
+                                          self._ozw_node.is_failed),
+                self._client.set_property(self._manufacturer_id_path,
+                                          self._ozw_node.manufacturer_id),
+                self._client.set_property(self._manufacturer_name_path,
+                                          self._ozw_node.manufacturer_name),
+                self._client.set_property(self._neighbours_path,
+                                          self._ozw_node.neighbours),
+                self._client.set_property(self._product_id_path,
+                                          self._ozw_node.product_id),
+                self._client.set_property(self._product_name_path,
+                                          self._ozw_node.product_name),
+                self._client.set_property(self._product_type_path,
+                                          self._ozw_node.product_type),
+                self._client.watch_event(self._heal_path,
+                                         self._on_heal),
+                self._client.watch_event(self._set_config_param_path,
+                                         self._on_set_config_param),
+                self._client.watch_event(self._remove_failed_node_path,
+                                         self._on_remove_failed_node),
+            ], loop=self._loop)
+        finally:
+            self._is_initialised.set()
+    
+    async def remove(self):
+        """
+        Unregister this node from Qth.
+        """
+        await self._is_initialised.wait()
+        await asyncio.wait([
+            self._client.unregister(self._is_failed_path),
+            self._client.unregister(self._manufacturer_id_path),
+            self._client.unregister(self._manufacturer_name_path),
+            self._client.unregister(self._neighbours_path),
+            self._client.unregister(self._product_id_path),
+            self._client.unregister(self._product_name_path),
+            self._client.unregister(self._product_type_path),
+            self._client.unregister(self._heal_path),
+            self._client.unregister(self._set_config_param_path),
+            self._client.unregister(self._remove_failed_node_path),
+            self._client.delete_property(self._is_failed_path),
+            self._client.delete_property(self._manufacturer_id_path),
+            self._client.delete_property(self._manufacturer_name_path),
+            self._client.delete_property(self._neighbours_path),
+            self._client.delete_property(self._product_id_path),
+            self._client.delete_property(self._product_name_path),
+            self._client.delete_property(self._product_type_path),
+            self._client.unwatch_event(self._heal_path,
+                                       self._on_heal),
+            self._client.unwatch_event(self._set_config_param_path,
+                                       self._on_set_config_param),
+            self._client.unwatch_event(self._remove_failed_node_path,
+                                       self._on_remove_failed_node),
+        ] + [
+            value.remove() for value in self._values.values()
+        ], loop=self._loop)
+    
+    def _on_heal(self, _topic, _arg):
+        self._ozw_node.heal()
+    
+    def _on_set_config_param(self, _topic, arg):
+        assert isinstance(arg, list), "Argument should be list."
+        assert len(arg) in [2, 3], "Argument must have two or three values."
+        self._ozw_node.set_config_param(*arg)
+    
+    def _on_remove_failed_node(self, _topic, _arg):
+        assert this._ozw_node.is_failed
+        self._ozw_network.controller.remove_failed_node(this._ozw_node.node_id)
+    
+    async def on_value_changed(self, ozw_value):
+        """
+        Call when a value is added or deleted or when that value has changed.
+        """
+        # TODO
 
-"""
-Properties to expose for each ZWave Value.
-"""
-VALUE_PROPERTIES = {
-    "id_on_network": ("System-wide unique ZWave ID of the value.", None),
-    "units": ("Units used for this value.", None),
-    "max": ("Maximum value.", None),
-    "min": ("Minimum value.", None),
-    "type": ("ZWave value type specification.", None),
-    "genre": ("Is this a Basic, User, Config or System value?", None),
-    "index": ("The ZWave command class index.", None),
-    "data": ("The value's... value!", None),
-    "data_as_string": ("The value as a string.", None),
-    "data_items": ("Possible values when a List type value.", list),
-    "is_set": ("True if the value reported was sent from the device", None),
-    "is_read_only": ("Is the value read-only.", None),
-    "is_write_only": ("Is the value write-only.", None),
-    "is_polled": ("Is the device polled?", None),
-    "command_class": ("The ZWave command class.", None),
-    "precision": ("The precision of the value", None),
-}
-
-
-"""
-Names an descriptions of all events which can be triggered on a Node.
-"""
-NODE_EVENTS = {
-    "heal": "Send the ZWave 'heal' command to the node. If the value is "
-            "truthy, also updates routes.",
-    "assign_return_route": "Request a Node re-find its return route to the "
-                           "controller.",
-    "refresh_info": "Request an update of all ZWave info.",
-    "request_state": "Trigger fetching of dynamic ZWave info (e.g. values).",
-    "neighbour_update": "Request a node update its neighbour tables.",
-    "request_all_config_params": "Request known config params be fetched "
-                                 "from the node.",
-    "request_config_param": "Request a particular config parameter be reported.",
-    "set_config_param": "Set a particular config parameter to a new value. "
-                        "Takes an array of 2 or 3 arguments: the param ID, "
-                        "value and optionally the size in bytes",
-}
+class Network(object):
+    """
+    Logic for keeping a ZWave network object in sync with its Qth interface.
+    """
+    
+    def __init__(self, client, loop, ozw_network, qth_base_path):
+        self._client = client
+        self._loop = loop
+        self._ozw_network = ozw_network
+        self._qth_base_path = qth_base_path
+        
+        self._ready_path = self._qth_base_path + "ready"
+        self._state_path = self._qth_base_path + "state"
+        self._home_id_path = self._qth_base_path + "home_id"
+        
+        self._last_is_ready = None
+        self._last_state = None
+        self._last_home_id = None
+        
+        self._is_initialised = asyncio.Event(loop=self._loop)
+        
+        # {owz.ZWaveNode: Node, ...}
+        self._nodes = {}
+    
+    async def init_async(self):
+        """
+        Complete registration of the network. Must be called after
+        instantiation.
+        """
+        try:
+            await asyncio.wait([
+                self._client.register(
+                    self._ready_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "Boolean. True if the ZWave network is fully initialised.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._state_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "String. State of the OpenZWave client.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._home_id_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "Integer. The ZWave Home ID of the network.",
+                    delete_on_unregister=True),
+                self.on_network_state_change(),
+            ], loop=self._loop)
+        finally:
+            self._is_initialised.set()
+    
+    async def remove(self):
+        """
+        Unregister the network from Qth.
+        """
+        await self._is_initialised.wait()
+        await asyncio.wait([
+            self._client.unregister(self._ready_path),
+            self._client.unregister(self._state_path),
+            self._client.unregister(self._home_id_path),
+            self._client.delete_property(self._ready_path),
+            self._client.delete_property(self._state_path),
+            self._client.delete_property(self._home_id_path),
+        ] + [
+            node.remove() for node in self._nodes.values()
+        ], loop=self._loop)
+    
+    async def on_network_state_change(self):
+        """Call when the network state may have changed."""
+        todo = []
+        
+        state = self._ozw_network.state_str
+        if self._last_state != state:
+            todo.append(self._client.set_property(self._state_path, state))
+            self._last_state = state
+        
+        is_ready = self._ozw_network.state == self._ozw_network.STATE_READY
+        if self._last_is_ready != is_ready:
+            todo.append(self._client.set_property(self._ready_path, is_ready))
+            self._last_is_ready = is_ready
+        
+        home_id = self._ozw_network.home_id
+        if self._last_home_id != home_id:
+            todo.append(self._client.set_property(self._home_id_path, home_id))
+            self._last_home_id = home_id
+        
+        if todo:
+            await asyncio.wait(todo, loop=self._loop)
+    
+    async def on_nodes_changed(self):
+        """Call when the set of nodes may have changed."""
+        new_ozw_nodes = set(self._ozw_network.nodes.values())
+        registered_ozw_nodes = set(self._nodes.keys())
+        
+        added = new_ozw_nodes - registered_ozw_nodes
+        removed = registered_ozw_nodes - new_ozw_nodes
+        
+        todo = []
+        
+        # Add new nodes
+        for ozw_node in added:
+            node = Node(
+                self._client,
+                self._loop,
+                self._ozw_network,
+                ozw_node,
+                self._qth_base_path)
+            self._nodes[ozw_node] = node
+            todo.append(node.init_async())
+        
+        # Remove now absent nodes
+        for ozw_node in removed:
+            node = self._nodes.pop(ozw_node)
+            todo.append(node.remove())
+        
+        if todo:
+            await asyncio.wait(todo, loop=self._loop)
+    
+    async def on_value_changed(self, ozw_node, ozw_value):
+        """Call when the value of a node may have changed."""
+        await self._nodes[ozw_node].on_value_changed(ozw_value)
 
 
 class QthZwave(object):
@@ -99,33 +305,33 @@ class QthZwave(object):
     def __init__(self, zwave_config_path, zwave_user_path,
                  zwave_device="/dev/ttyACM0",
                  qth_base_path="sys/zwave/",
-                 host="localhost", port=1883, keepalive=10):
-        self._loop = asyncio.get_event_loop()
+                 host=None, port=None, keepalive=10, loop=None):
+        self._loop = loop or asyncio.get_event_loop()
         self._qth_base_path = qth_base_path
+        
         self._client = qth.Client("Qth-Zwave-Bridge",
                                   "Exposes Z-wave devices via Qth.",
                                   loop=self._loop, host=host, port=port,
-                                  kee=allow=keepalive)
+                                  keepalive=keepalive)
         
-        # For each node, gives the last knwon value of each of its properties
-        # which are exposed by Qth. These values are updated periodically and
-        # when changed the value is published via Qth.
-        #
-        # self._node_properties = {node_id: {propname: last_value, ...}, ...}
-        self._node_properties = {}
+        # Setup the OpenZWave client
+        self._init_openzwave(zwave_device, zwave_config_path, zwave_user_path)
         
-        # For each node, gives the registered Qth callback for all events
-        # registered for that node.
-        #
-        # self._node_events = {node_id: {eventname: cb_func, ...}, ...}
-        self._node_events = {}
+        # Setup the Qth mirror of the ZWave state
+        self._network = Network(self._client,
+                                self._loop,
+                                self._ozw_network,
+                                self._qth_base_path)
+        self._loop.create_task(self._network.init_async())
         
-        # For each value, the callback setup to watch for changes
-        #
-        # self._value_properties = {node_id: {value_id: cb, ...}, ...}
-        self._value_properties = {}
+        self._init_zwave_callbacks()
         
-        options = ZWaveOption(device,
+        self._ozw_network.start()
+    
+    def _init_openzwave(self, zwave_device, zwave_config_path, zwave_user_path):
+        """Initialise the OpenZWave client, leaving it ready to start."""
+        # Configure OpenZWave
+        options = ZWaveOption(zwave_device,
                               config_path=zwave_config_path,
                               user_path=zwave_user_path,
                               cmd_line="")
@@ -136,8 +342,10 @@ class QthZwave(object):
         options.set_logging(True)
         options.lock()
         
-        self._network = ZWaveNetwork(options, autostart=False)
-        
+        self._ozw_network = ZWaveNetwork(options, autostart=False)
+    
+    def _init_zwave_callbacks(self):
+        """Setup callbacks for key OpenZWave events."""
         for state in [ZWaveNetwork.SIGNAL_NETWORK_FAILED,
                       ZWaveNetwork.SIGNAL_NETWORK_STARTED,
                       ZWaveNetwork.SIGNAL_NETWORK_READY,
@@ -145,146 +353,31 @@ class QthZwave(object):
                       ZWaveNetwork.SIGNAL_NETWORK_RESETTED,
                       ZWaveNetwork.SIGNAL_NETWORK_AWAKED]:
             dispatcher.connect(
-                self._make_network_state_change_callback(state),
-                state)
+                (lambda *_, **__:
+                    self._loop.create_task(
+                        self._network.on_network_state_change())),
+                state, weak=False)
         
-        dispatcher.connect(self._on_node_added,
-            ZWaveNetwork.SIGNAL_NODE_ADDED)
-        dispatcher.connect(self._on_node_removed,
-            ZWaveNetwork.SIGNAL_NODE_REMOVED)
+        for signal in [ZWaveNetwork.SIGNAL_NODE_ADDED,
+                       ZWaveNetwork.SIGNAL_NODE_REMOVED,
+                       ZWaveNetwork.SIGNAL_NODE_EVENT]:
+            dispatcher.connect(
+                (lambda *_, **__:
+                    self._loop.create_task(
+                        self._network.on_nodes_changed())),
+                signal, weak=False)
         
-        dispatcher.connect(self._on_value_added,
-            ZWaveNetwork.SIGNAL_VALUE_ADDED)
-        dispatcher.connect(self._on_value_changed,
-            ZWaveNetwork.SIGNAL_VALUE_CHANGED)
-        dispatcher.connect(self._on_value_removed,
-            ZWaveNetwork.SIGNAL_VALUE_REMOVED)
-        
-        self._network.start()
-    
-    def _make_network_state_change_callback(self, state):
-        """
-        Create a callback to set the network_state property upon a change in
-        zwave network state.
-        """
-        def cb(*args, **kwargs):
-            self._loop.create_task(
-                self._client.set(
-                    self._qth_base_path + "network_state",
-                    state[len("Network"):]))
-        return cb
-    
-    def _node_path(self. node_id):
-        return "{}nodes/{}/".format(self._qth_base_path, node_id)
-    
-    def _value_path(self. node_id, value_id):
-        label = self._network.nodes[node_id].values[value_id].label
-        return "{}nodes/{}/values/{}-{}".format(self._qth_base_path, node_id, label, value_id)
-    
-    def _update_node_properties(self, node_id, node):
-        """
-        Update the Qth published properties for a Node. If ``node`` is None,
-        removes the properties entirely.
-        """
-        node_path = self._node_path(node_id)
-        
-        if node_id not in self._node_properties:
-            self._node_properties[node_id] = {}
-        
-        if node is not None:
-            properties = self._node_properties[node_id]
-            for name, (description, convert) in NODE_PROPERTIES.items():
-                # Register if required
-                if name not in properties:
-                    self._loop.create_task(self._client.register(
-                        node_path + name,
-                        description,
-                        qth.PROPERTY_MANY_TO_ONE))
-                
-                # Update value if required
-                value = getattr(self._network.nodes[node_id], name)
-                if convert:
-                    value = convert(value)
-                if name not in properties or properties[name] != value:
-                    self._loop.create_task(self._client.set_property(
-                        node_path + name, value))
-                properties[name] = value
-        else:
-            # Unregister all properties if node is None
-            old_properties = self._node_properties.pop(node_id)
-            for name in old_properties:
-                self._loop.create_task(self._client.unreigster(node_path + name))
-                self._loop.create_task(self._client.delete_property(node_path + name))
-    
-    def _setup_node_events(self, node_id):
-        """Add callback handlers for all events."""
-        node_path = self._node_path(node_id)
-        
-        if node_id not in self._node_events:
-            events = {}
-            self._node_events[node_id] = events
-            
-            for name, description in NODE_EVENTS.items():
-                self._loop.create_task(self._client.register(
-                    node_path + name, description, qth.EVENT_MANY_TO_ONE))
-                events[name] = partial(getattr(self, "_on_{}".format(name)), node_id)
-                self._loop.create_task(self._client.watch_event(
-                    node_path + name, events[name]))
-    
-    def _remove_node_events(self, node_id):
-        """Remove callbacks and registrations for all events."""
-        node_path = self._node_path(node_id)
-        
-        if node_id not in self._node_events:
-            for name, callback in self._node_events.pop(node_id).items():
-                self._loop.create_task(self._client.unregister(node_path + name))
-                self._loop.create_task(self._client.unwatch_event(
-                    node_path + name, callback))
-    
-    def _on_node_added(self, node, *args, **kwargs):
-        node_path = self._node_path(node.node_id)
-        
-        self._update_node_properties(node.node_id, node)
-        self._setup_node_events(node.node_id)
-    
-    def _on_heal(self, node_id, _topic, arg):
-        self._network.nodes[node_id].heal(bool(arg))
-    
-    def _on_assign_return_route(self, node_id, _topic, _arg):
-        self._network.nodes[node_id].assign_return_route()
-    
-    def _on_refresh_info(self, node_id, _topic, _arg):
-        self._network.nodes[node_id].refresh_info()
-    
-    def _on_request_state(self, node_id, _topic, _arg):
-        self._network.nodes[node_id].request_state()
-    
-    def _on_neighbour_update(self, node_id, _topic, _arg):
-        self._network.nodes[node_id].neighbour_update()
-    
-    def _on_request_all_config_params(self, node_id, _topic, _arg):
-        # TODO: Setup reporting of this parameter ID? Comes via Values
-        # somehow...
-        self._network.nodes[node_id].request_all_config_params()
-    
-    def _on_request_config_param(self, node_id, _topic, arg):
-        # TODO: Setup reporting of this parameter ID? Comes via Values
-        # somehow...
-        self._network.nodes[node_id].request_config_param(arg)
-    
-    def _on_set_config_param(self, node_id, _topic, arg):
-        self._network.nodes[node_id].set_config_param(*arg)
-    
-    def _on_node_removed(self, node, *args, **kwargs):
-        self._update_node_properties(node.node_id, None)
-    
-    
-    
-    def _on_value_added(self, node, value, *args, **kwargs):
-        pass  # TODO
-    
-    def _on_value_changed(self, *args, **kwargs):
-        pass  # TODO
-    
-    def _on_value_removed(self, *args, **kwargs):
-        pass  # TODO
+        for signal in [ZWaveNetwork.SIGNAL_VALUE_ADDED,
+                       ZWaveNetwork.SIGNAL_VALUE_REMOVED,
+                       ZWaveNetwork.SIGNAL_VALUE_REFRESHED,
+                       ZWaveNetwork.SIGNAL_VALUE_CHANGED]:
+            dispatcher.connect(
+                (lambda node, value, *_, **__:
+                    self._loop.create_task(
+                        self._network.on_value_changed(node, value))),
+                signal, weak=False)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    qth_zwave = QthZwave("ozw/config", "zwave", loop=loop)
+    loop.run_forever()
