@@ -14,6 +14,7 @@ from openzwave.network import ZWaveNetwork
 
 import qth
 
+from .version import __version__
 
 def normalise_value_label(label, used_labels=set()):
     """
@@ -34,9 +35,10 @@ class Value(object):
     """
     Logic which keeps a ZWave value object in sync with its Qth interface.
     """
-    def __init__(self, client, loop, ozw_value, qth_base_path, used_labels):
+    def __init__(self, client, loop, ozw_network, ozw_value, qth_base_path, used_labels):
         self._client = client
         self._loop = loop
+        self._ozw_network = ozw_network
         self._ozw_value = ozw_value
         
         self._is_initialised = asyncio.Event(loop=self._loop)
@@ -47,13 +49,21 @@ class Value(object):
         self._value_path = (
             qth_base_path +
             "values/{}".format(self._label))
-        self._setter_path = "{}/set".format(self._value_path)
+        self._units_path = "{}/units".format(self._value_path)
+        self._refresh_path = "{}/refresh".format(self._value_path)
+
+        # Values reported by zwave and set in Qth which we expect to shortly
+        # receive echoed back from Qth (and we should ignore)
+        self._expected_values = []
         
         # The last value received/sent from/to Qth. This will (should!) never
         # be qth.Empty so this simply acts as a sentinel to cause the value to
         # be set immediately during the call to on_zwave_value_changed called
         # by init_async.
         self._last_qth_value = qth.Empty
+        
+        # Last units written to Qth
+        self._last_qth_units = qth.Empty
     
     async def init_async(self):
         """
@@ -63,15 +73,23 @@ class Value(object):
             await asyncio.wait([
                 self._client.register(
                     self._value_path,
-                    qth.PROPERTY_ONE_TO_MANY,
-                    "The value of the value. (Set via the ./set event.)"),
+                    qth.PROPERTY_MANY_TO_ONE,
+                    "The value of the value.",
+                    delete_on_unregister=True),
                 self._client.register(
-                    self._setter_path,
+                    self._units_path,
+                    qth.PROPERTY_ONE_TO_MANY,
+                    "The units this value is expressed in.",
+                    delete_on_unregister=True),
+                self._client.register(
+                    self._refresh_path,
                     qth.EVENT_MANY_TO_ONE,
-                    "Set the value of this value."),
+                    "Triggers a refresh of this value"),
                 self.on_zwave_value_changed(),
-                self._client.watch_event(self._setter_path,
-                                         self._on_qth_value_set),
+                self._client.watch_property(self._value_path,
+                                            self._on_qth_value_set),
+                self._client.watch_event(self._refresh_path,
+                                         self._on_refresh),
             ], loop=self._loop)
         finally:
             self._is_initialised.set()
@@ -88,20 +106,55 @@ class Value(object):
         
         await asyncio.wait([
             self._client.unregister(self._value_path),
+            self._client.unregister(self._units_path),
+            self._client.unregister(self._refresh_path),
             self._client.delete_property(self._value_path),
+            self._client.delete_property(self._units_path),
+            self._client.unwatch_event(self._refresh_path, self._on_refresh),
         ], loop=self._loop)
+    
+    async def _on_refresh(self, _topic, _value):
+        """Called when the refresh event is sent."""
+        self._ozw_value.refresh()
     
     async def on_zwave_value_changed(self):
         """Called when the ZWave value reports a change."""
         value = self._ozw_value.data
         if value != self._last_qth_value:
             self._last_qth_value = value
+            self._expected_values.append(value)
             await self._client.set_property(self._value_path, value)
+        
+        units = self._ozw_value.units
+        if units != self._last_qth_units:
+            self._last_qth_units = units
+            await self._client.set_property(self._units_path, units)
     
     async def _on_qth_value_set(self, _topic, value):
         """Called when the Qth value/set event is sent."""
-        self._ozw_value.data = value
-        self.on_zwave_value_changed()
+        if value in self._expected_values:
+            self._expected_values.remove(value)
+        else:
+            if not self._ozw_value.is_read_only:
+                checked_value = self._ozw_value.check_data(value)
+            else:
+                checked_value = None
+            
+            if checked_value is not None and checked_value == value:
+                # Value is valid, set that
+                self._ozw_value.data = checked_value
+                self._last_qth_value = value
+            elif checked_value is not None:
+                # Value is not valid, but has been converted to a valid value,
+                # re-set the Qth value and when that callback arrives, set the
+                # OZW value.
+                await self._client.set_property(self._value_path,
+                                                checked_value)
+            else:
+                # Value is not valid, revert to previous value
+                self._expected_values.append(self._last_qth_value)
+                await self._client.set_property(self._value_path,
+                                                self._last_qth_value)
 
 
 class Node(object):
@@ -290,6 +343,7 @@ class Node(object):
             value = Value(
                 self._client,
                 self._loop,
+                self._ozw_network,
                 ozw_value,
                 self._qth_base_path,
                 self._used_value_labels)
@@ -451,7 +505,7 @@ class QthZwave(object):
         self._loop = loop or asyncio.get_event_loop()
         self._qth_base_path = qth_base_path
         
-        self._client = qth.Client("Qth-Zwave-Bridge",
+        self._client = qth.Client("qth_zwave",
                                   "Exposes Z-wave devices via Qth.",
                                   loop=self._loop, host=host, port=port,
                                   keepalive=keepalive)
@@ -525,8 +579,47 @@ class QthZwave(object):
                         self._network.on_value_changed(node, value))),
                 signal, weak=False)
 
-if __name__ == "__main__":
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="A Qth bridge for ZWave")
+    
+    parser.add_argument("--openzwave-config", "-z",
+                        default="open-zwave/config",
+                        help="Path of OpenZWave 'config' directory defining "
+                             "options for all available ZWave devices.")
+    parser.add_argument("--user-path", "-u", default="zwave",
+                        help="Path of directory to store OpenZWave persistant "
+                             "data.")
+    parser.add_argument("--device", "-d", default="/dev/ttyACM0",
+                        help="Path of ZWave controller serial port.")
+    parser.add_argument("--qth-base", "-q", default="sys/zwave/",
+                        help="Prefix for all Qth values.")
+    
+    parser.add_argument("--host", "-H", default=None,
+                        help="Qth (MQTT) server hostname.")
+    parser.add_argument("--port", "-P", default=None, type=int,
+                        help="Qth (MQTT) server port number.")
+    parser.add_argument("--keepalive", "-K", default=10, type=int,
+                        help="MQTT keepalive interval (seconds).")
+    parser.add_argument("--version", "-V", action="version",
+                        version="$(prog)s {}".format(__version__))
+    
+    args = parser.parse_args()
+    
     loop = asyncio.get_event_loop()
     loop.set_debug(True)
-    qth_zwave = QthZwave("ozw/config", "zwave", loop=loop)
+    
+    qth_zwave = QthZwave(zwave_config_path=args.openzwave_config,
+                         zwave_user_path=args.user_path,
+                         zwave_device=args.device,
+                         qth_base_path=args.qth_base,
+                         host=args.host,
+                         port=args.port,
+                         keepalive=args.keepalive,
+                         loop=loop)
     loop.run_forever()
+
+
+if __name__ == "__main__":
+    main()

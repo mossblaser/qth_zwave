@@ -1,0 +1,7 @@
+pip-selfcheck.json
+.*
+*.swp
+*~
+*.pyc
+zwave
+open-zwave
