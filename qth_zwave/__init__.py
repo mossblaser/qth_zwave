@@ -376,6 +376,9 @@ class Network(object):
         self._ready_path = self._qth_base_path + "ready"
         self._state_path = self._qth_base_path + "state"
         self._home_id_path = self._qth_base_path + "home_id"
+        self._heal_path = self._qth_base_path + "heal_network"
+        self._add_node_path = self._qth_base_path + "add_node"
+        self._remove_node_path = self._qth_base_path + "remove_node"
         
         self._last_is_ready = None
         self._last_state = None
@@ -408,6 +411,21 @@ class Network(object):
                     qth.PROPERTY_ONE_TO_MANY,
                     "Integer. The ZWave Home ID of the network.",
                     delete_on_unregister=True),
+                self._client.register(
+                    self._heal_path,
+                    qth.EVENT_MANY_TO_ONE,
+                    "Trigger the network healing process."),
+                self._client.register(
+                    self._add_node_path,
+                    qth.EVENT_MANY_TO_ONE,
+                    "Set the controller to node-adding mode."),
+                self._client.register(
+                    self._remove_node_path,
+                    qth.EVENT_MANY_TO_ONE,
+                    "Set the controller to node-removing mode."),
+                self._client.watch_event(self._heal_path, self.on_heal),
+                self._client.watch_event(self._add_node_path, self.on_add_node),
+                self._client.watch_event(self._remove_node_path, self.on_remove_node),
                 self.on_network_state_change(),
             ], loop=self._loop)
         finally:
@@ -422,9 +440,13 @@ class Network(object):
             self._client.unregister(self._ready_path),
             self._client.unregister(self._state_path),
             self._client.unregister(self._home_id_path),
+            self._client.unregister(self._heal_path),
+            self._client.unregister(self._add_node_path),
+            self._client.unregister(self._remove_node_path),
             self._client.delete_property(self._ready_path),
             self._client.delete_property(self._state_path),
             self._client.delete_property(self._home_id_path),
+            self._client.unwatch_event(self._heal_path, self.on_heal),
         ] + [
             node.remove() for node in self._nodes.values()
         ], loop=self._loop)
@@ -494,6 +516,18 @@ class Network(object):
         """Call when the value of a node may have changed."""
         if ozw_node in self._nodes:
             await self._nodes[ozw_node].on_value_changed(ozw_value)
+    
+    async def on_heal(self, _path, _value):
+        """Called when the 'heal_network' event is fired."""
+        self._ozw_network.heal(True)
+    
+    async def on_add_node(self, _path, _value):
+        """Called when the 'add_node' event is fired."""
+        self._ozw_network.controller.add_node()
+    
+    async def on_remove_node(self, _path, value):
+        """Called when the 'remove_node' event is fired."""
+        self._ozw_network.controller.remove_node()
 
 
 class QthZwave(object):
